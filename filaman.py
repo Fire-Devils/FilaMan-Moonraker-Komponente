@@ -29,6 +29,7 @@ if TYPE_CHECKING:
 DB_NAMESPACE = "moonraker"
 ACTIVE_SPOOL_KEY = "filaman.spool_id"
 LEGACY_ACTIVE_SPOOL_KEY = "spoolman.spool_id"
+EXTRUDER_SPOOLS_KEY = "filaman.extruder_spools"
 
 DEFAULT_PLA_DENSITY_G_CM3 = 1.24
 DEFAULT_FILAMENT_DIAMETER_MM = 1.75
@@ -67,6 +68,7 @@ class FilaManManager:
 
         self.api_connected: bool = False
         self.spool_id: Optional[int] = None
+        self.extruder_spools: Dict[str, Optional[int]] = {}
         self._highest_epos: float = 0.0
         self._last_epos: float = 0.0
         self._current_extruder: str = "extruder"
@@ -155,6 +157,7 @@ class FilaManManager:
 
     def _register_notifications(self) -> None:
         self._register_notification_safe("filaman:active_spool_set")
+        self._register_notification_safe("filaman:extruder_spools_changed")
         self._register_notification_safe("filaman:filaman_status_changed")
         self._register_notification_safe("spoolman:active_spool_set")
         self._register_notification_safe("spoolman:spoolman_status_changed")
@@ -174,6 +177,11 @@ class FilaManManager:
                 f"{prefix}/spool_id",
                 RequestType.GET | RequestType.POST,
                 self._handle_spool_id_request,
+            )
+            self.server.register_endpoint(
+                f"{prefix}/spool_ids",
+                RequestType.GET,
+                self._handle_spool_ids_request,
             )
             self.server.register_endpoint(
                 f"{prefix}/proxy",
@@ -201,6 +209,12 @@ class FilaManManager:
         return [self.spool_id]
 
     async def component_init(self) -> None:
+        stored_extruder_spools = await self.database.get_item(
+            DB_NAMESPACE, EXTRUDER_SPOOLS_KEY, None
+        )
+        if isinstance(stored_extruder_spools, dict):
+            self.extruder_spools = stored_extruder_spools
+
         self.spool_id = await self.database.get_item(DB_NAMESPACE, ACTIVE_SPOOL_KEY, None)
         if self.spool_id is None:
             self.spool_id = await self.database.get_item(
@@ -261,9 +275,24 @@ class FilaManManager:
         logging.debug(f"Initial epos: {initial_e_pos}")
         if initial_e_pos is not None:
             self._highest_epos = initial_e_pos
+            self._last_epos = initial_e_pos
         else:
             logging.error("FilaMan integration unable to subscribe to epos")
             raise self.server.error("Unable to subscribe to e position")
+
+        if self.extruder_spools:
+            # Use per-extruder assignment for current extruder
+            self.spool_id = self.extruder_spools.get(self._current_extruder)
+            logging.info(
+                f"Restored spool {self.spool_id} for active extruder {self._current_extruder}"
+            )
+        elif self.spool_id is not None:
+            # Migrate legacy single spool_id into extruder_spools
+            self.extruder_spools[self._current_extruder] = self.spool_id
+            self.database.insert_item(DB_NAMESPACE, EXTRUDER_SPOOLS_KEY, self.extruder_spools)
+            logging.info(
+                f"Migrated legacy spool_id {self.spool_id} to extruder {self._current_extruder}"
+            )
 
     def _handle_status_update(self, status: Dict[str, Any], _: float) -> None:
         toolhead: Optional[Dict[str, Any]] = status.get("toolhead")
@@ -273,9 +302,20 @@ class FilaManManager:
         epos: float = toolhead.get("position", [0, 0, 0, self._highest_epos])[3]
         self._last_epos = epos
         extr = toolhead.get("extruder", self._current_extruder)
+
         if extr != self._current_extruder:
             self._highest_epos = epos
             self._current_extruder = extr
+            # Switch active spool to the one assigned to the new extruder
+            new_spool_id = self.extruder_spools.get(extr)
+            if new_spool_id != self.spool_id:
+                self.spool_id = new_spool_id
+                self.database.insert_item(DB_NAMESPACE, ACTIVE_SPOOL_KEY, new_spool_id)
+                self.database.insert_item(DB_NAMESPACE, LEGACY_ACTIVE_SPOOL_KEY, new_spool_id)
+                payload = {"spool_id": new_spool_id}
+                self.server.send_event("filaman:active_spool_set", payload)
+                self.server.send_event("spoolman:active_spool_set", payload)
+                logging.info(f"Toolchange to {extr}, switched to spool {new_spool_id}")
         elif epos > self._highest_epos:
             if self.spool_id is not None:
                 self._add_extrusion(self.spool_id, epos - self._highest_epos)
@@ -333,30 +373,42 @@ class FilaManManager:
             request_timeout=request_timeout,
         )
 
-    def set_active_spool(self, spool_id: Union[int, None]) -> None:
-        if spool_id is not None and not isinstance(spool_id, int):
+    def set_extruder_spool(self, extruder: str, spool_id: Optional[int]) -> None:
+        """Assign a spool to a specific extruder."""
+        if not isinstance(spool_id, int) and spool_id is not None:
             raise self.server.error("spool_id must be an integer or None")
-        if self.spool_id == spool_id:
-            logging.info(f"Spool ID already set to: {spool_id}")
+
+        old_id = self.extruder_spools.get(extruder)
+        if old_id == spool_id and (extruder != self._current_extruder or self.spool_id == spool_id):
+            logging.info(f"Spool for {extruder} already set to {spool_id}")
             return
 
-        self.spool_history.tracker.update(spool_id)
-        self.spool_id = spool_id
+        self.extruder_spools[extruder] = spool_id
+        self.database.insert_item(DB_NAMESPACE, EXTRUDER_SPOOLS_KEY, self.extruder_spools)
+        self.server.send_event(
+            "filaman:extruder_spools_changed",
+            {"extruder_spools": self.extruder_spools}
+        )
 
-        self.database.insert_item(DB_NAMESPACE, ACTIVE_SPOOL_KEY, spool_id)
-        self.database.insert_item(DB_NAMESPACE, LEGACY_ACTIVE_SPOOL_KEY, spool_id)
+        if extruder == self._current_extruder:
+            self.spool_history.tracker.update(spool_id)
+            self.spool_id = spool_id
+            self._highest_epos = self._last_epos
+            self.database.insert_item(DB_NAMESPACE, ACTIVE_SPOOL_KEY, spool_id)
+            self.database.insert_item(DB_NAMESPACE, LEGACY_ACTIVE_SPOOL_KEY, spool_id)
+            payload = {"spool_id": spool_id}
+            self.server.send_event("filaman:active_spool_set", payload)
+            self.server.send_event("spoolman:active_spool_set", payload)
 
-        self._highest_epos = self._last_epos
+            if spool_id is not None:
+                self._cancel_spool_check_task()
+                self.spool_check_task = self.eventloop.create_task(self._check_spool_deleted())
 
-        payload = {"spool_id": spool_id}
-        self.server.send_event("filaman:active_spool_set", payload)
-        self.server.send_event("spoolman:active_spool_set", payload)
+        logging.info(f"Set spool for {extruder} to: {spool_id}")
 
-        if spool_id is not None:
-            self._cancel_spool_check_task()
-            self.spool_check_task = self.eventloop.create_task(self._check_spool_deleted())
-
-        logging.info(f"Setting active spool to: {spool_id}")
+    def set_active_spool(self, spool_id: Union[int, None]) -> None:
+        """Set spool for the currently active extruder (backward-compatible)."""
+        self.set_extruder_spool(self._current_extruder, spool_id)
 
     async def _check_spool_deleted(self) -> None:
         try:
@@ -508,16 +560,29 @@ class FilaManManager:
         return self.eventloop.get_loop_time() + self.sync_rate_seconds
 
     async def _handle_spool_id_request(self, web_request: WebRequest) -> Dict[str, Any]:
+        extruder = web_request.get_str("extruder", None)
+
         if web_request.get_request_type() == RequestType.POST:
             spool_id = web_request.get_int("spool_id", None)
-            self.set_active_spool(spool_id)
-        return {"spool_id": self.spool_id}
+            target = extruder if extruder is not None else self._current_extruder
+            self.set_extruder_spool(target, spool_id)
+
+        if extruder is not None:
+            return {
+                "spool_id": self.extruder_spools.get(extruder),
+                "extruder": extruder,
+                "extruder_spools": self.extruder_spools,
+            }
+        return {"spool_id": self.spool_id, "extruder_spools": self.extruder_spools}
+
+    async def _handle_spool_ids_request(self, web_request: WebRequest) -> Dict[str, Any]:
+        return {"extruder_spools": self.extruder_spools}
 
     def _normalize_proxy_path(self, path: str) -> str:
         if path.startswith("/api/v1"):
-            suffix = path[len("/api/v1") :]
+            suffix = path[len("/api/v1"):]
         elif path.startswith("/v1"):
-            suffix = path[len("/v1") :]
+            suffix = path[len("/v1"):]
         elif path.startswith("/"):
             suffix = path
         else:
@@ -529,11 +594,11 @@ class FilaManManager:
         if suffix == "/spool":
             return "/spools"
         if suffix.startswith("/spool/"):
-            return "/spools/" + suffix[len("/spool/") :]
+            return "/spools/" + suffix[len("/spool/"):]
         if suffix == "/filament":
             return "/filaments"
         if suffix.startswith("/filament/"):
-            return "/filaments/" + suffix[len("/filament/") :]
+            return "/filaments/" + suffix[len("/filament/"):]
 
         return suffix
 
@@ -652,6 +717,7 @@ class FilaManManager:
             "pending_reports": pending,
             "pending_reports_count": len(pending),
             "spool_id": self.spool_id,
+            "extruder_spools": self.extruder_spools,
             "last_error": self._last_error,
             "last_success_at": self._last_success_at,
         }
