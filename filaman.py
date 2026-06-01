@@ -405,6 +405,93 @@ class FilaManManager:
                 self.spool_check_task = self.eventloop.create_task(self._check_spool_deleted())
 
         logging.info(f"Set spool for {extruder} to: {spool_id}")
+        self.eventloop.create_task(self._push_spool_to_printer(extruder, spool_id))
+
+    # ------------------------------------------------------------------ #
+    # Printer push: spool color/material → filament_detect/set            #
+    # ------------------------------------------------------------------ #
+
+    def _extruder_to_channel(self, extruder: str) -> int:
+        if extruder == "extruder":
+            return 0
+        m = re.match(r"^extruder(\d+)$", extruder)
+        return int(m.group(1)) if m else 0
+
+    def _hex_to_rgb_int(self, hex_color: Optional[str]) -> Optional[int]:
+        if not hex_color:
+            return None
+        h = hex_color.lstrip("#")
+        if len(h) == 6:
+            with contextlib.suppress(ValueError):
+                return int(h, 16)
+        return None
+
+    async def _push_spool_to_printer(self, extruder: str, spool_id: Optional[int]) -> None:
+        """Forward spool color/material to the printer via filament_detect/set."""
+        channel = self._extruder_to_channel(extruder)
+        port = self.server.get_host_info()["port"]
+        url = f"http://localhost:{port}/printer/filament_detect/set"
+
+        if spool_id is None:
+            body: Dict[str, Any] = {"channel": channel, "info": {}}
+            response = await self.http_client.request(
+                method="POST", url=url, body=body,
+                connect_timeout=2.0, request_timeout=5.0,
+            )
+            if response.has_error():
+                logging.debug(
+                    f"filament_detect clear ch{channel} failed: {response.error}"
+                )
+            return
+
+        spool_data, response = await self._fetch_spool(spool_id)
+        if spool_data is None:
+            return
+
+        filament: Dict[str, Any] = spool_data.get("filament") or {}
+        info: Dict[str, Any] = {}
+
+        # Vendor
+        manufacturer: Dict[str, Any] = filament.get("manufacturer") or {}
+        vendor = manufacturer.get("name")
+        if vendor:
+            info["VENDOR"] = str(vendor)
+
+        # Material type
+        material_type = filament.get("material_type")
+        if material_type:
+            info["MAIN_TYPE"] = str(material_type)
+
+        # Colors (primary + up to 4 additional)
+        colors: List[Any] = filament.get("colors") or []
+        for i, color_entry in enumerate(colors[:5]):
+            hex_code = (color_entry.get("color") or {}).get("hex_code")
+            rgb_int = self._hex_to_rgb_int(hex_code)
+            if rgb_int is not None:
+                key = "RGB_1" if i == 0 else f"RGB_{i + 1}"
+                info[key] = rgb_int
+        if "RGB_1" in info:
+            info["ALPHA"] = 255
+
+        if not info:
+            logging.debug(f"No filament metadata for spool {spool_id}, skipping printer push")
+            return
+
+        body = {"channel": channel, "info": info}
+        response = await self.http_client.request(
+            method="POST", url=url, body=body,
+            connect_timeout=2.0, request_timeout=5.0,
+        )
+        if response.has_error():
+            logging.debug(
+                f"filament_detect set ch{channel} spool {spool_id} failed: {response.error}"
+            )
+        else:
+            logging.info(
+                f"Pushed spool {spool_id} → printer channel {channel}: "
+                f"type={info.get('MAIN_TYPE')}, vendor={info.get('VENDOR')}, "
+                f"color=#{info.get('RGB_1', 0):06X}"
+            )
 
     def set_active_spool(self, spool_id: Union[int, None]) -> None:
         """Set spool for the currently active extruder (backward-compatible)."""
