@@ -46,6 +46,19 @@ class FilaManManager:
         self.reconnect_delay: float = 2.0
         self.connected_check_delay: float = 30.0
 
+        self.track_filament_sensors: bool = config.getboolean(
+            "track_filament_sensors", default=True
+        )
+        self.clear_spool_on_runout: bool = config.getboolean(
+            "clear_spool_on_runout", default=True
+        )
+        self.runout_debounce: float = config.getfloat(
+            "runout_debounce", default=1.0, minval=0.0
+        )
+        self.sensor_map_override: Dict[str, str] = config.getdict(
+            "filament_sensors", default={}
+        )
+
         self.default_density_g_cm3 = self._get_float_option(
             config,
             "default_density_g_cm3",
@@ -72,6 +85,11 @@ class FilaManManager:
         self._highest_epos: float = 0.0
         self._last_epos: float = 0.0
         self._current_extruder: str = "extruder"
+
+        # Klipper object name ("filament_switch_sensor e0_filament") -> extruder name
+        self.filament_sensors: Dict[str, str] = {}
+        self.filament_present: Dict[str, bool] = {}
+        self._runout_timers: Dict[str, asyncio.TimerHandle] = {}
 
         self._error_logged: bool = False
         self._last_error: Optional[str] = None
@@ -159,6 +177,7 @@ class FilaManManager:
         self._register_notification_safe("filaman:active_spool_set")
         self._register_notification_safe("filaman:extruder_spools_changed")
         self._register_notification_safe("filaman:filaman_status_changed")
+        self._register_notification_safe("filaman:filament_presence_changed")
         self._register_notification_safe("spoolman:active_spool_set")
         self._register_notification_safe("spoolman:spoolman_status_changed")
 
@@ -265,10 +284,24 @@ class FilaManManager:
         return self.api_connected
 
     async def _handle_klippy_ready(self) -> None:
+        # Klippy may reconnect at any time, so rebuild the sensor state from scratch.
+        self._cancel_runout_timers()
+        self.filament_sensors = {}
+        self.filament_present = {}
+        if self.track_filament_sensors:
+            await self._discover_filament_sensors()
+
+        objects: Dict[str, Optional[List[str]]] = {
+            "toolhead": ["position", "extruder"]
+        }
+        for obj_name in self.filament_sensors:
+            objects[obj_name] = ["filament_detected"]
+
         result: Dict[str, Dict[str, Any]]
         result = await self.klippy_apis.subscribe_objects(
-            {"toolhead": ["position", "extruder"]}, self._handle_status_update, {}
+            objects, self._handle_status_update, {}
         )
+        self._apply_sensor_states(result, initial=True)
         toolhead = result.get("toolhead", {})
         self._current_extruder = toolhead.get("extruder", "extruder")
         initial_e_pos = toolhead.get("position", [None] * 4)[3]
@@ -296,30 +329,165 @@ class FilaManManager:
 
     def _handle_status_update(self, status: Dict[str, Any], _: float) -> None:
         toolhead: Optional[Dict[str, Any]] = status.get("toolhead")
-        if toolhead is None:
+        if toolhead is not None:
+            epos: float = toolhead.get("position", [0, 0, 0, self._highest_epos])[3]
+            self._last_epos = epos
+            extr = toolhead.get("extruder", self._current_extruder)
+
+            if extr != self._current_extruder:
+                self._highest_epos = epos
+                self._current_extruder = extr
+                # Switch active spool to the one assigned to the new extruder
+                new_spool_id = self.extruder_spools.get(extr)
+                if new_spool_id != self.spool_id:
+                    self.spool_id = new_spool_id
+                    self.database.insert_item(DB_NAMESPACE, ACTIVE_SPOOL_KEY, new_spool_id)
+                    self.database.insert_item(
+                        DB_NAMESPACE, LEGACY_ACTIVE_SPOOL_KEY, new_spool_id
+                    )
+                    payload = {"spool_id": new_spool_id}
+                    self.server.send_event("filaman:active_spool_set", payload)
+                    self.server.send_event("spoolman:active_spool_set", payload)
+                    logging.info(f"Toolchange to {extr}, switched to spool {new_spool_id}")
+            elif epos > self._highest_epos:
+                if self.spool_id is not None:
+                    self._add_extrusion(self.spool_id, epos - self._highest_epos)
+                self._highest_epos = epos
+
+        self._apply_sensor_states(status)
+
+    # ------------------------------------------------------------------ #
+    # Filament runout sensors: detect a toolhead running empty            #
+    # ------------------------------------------------------------------ #
+
+    async def _discover_filament_sensors(self) -> None:
+        objects: List[str] = await self.klippy_apis.get_object_list(default=[])
+        known_extruders = {
+            name for name in objects
+            if name == "extruder" or re.match(r"^extruder\d+$", name)
+        }
+
+        for obj_name in objects:
+            if not obj_name.startswith(
+                ("filament_switch_sensor ", "filament_motion_sensor ")
+            ):
+                continue
+            sensor_name = obj_name.split(" ", 1)[1]
+            extruder = self._sensor_to_extruder(sensor_name, known_extruders)
+            if extruder is None:
+                logging.info(
+                    f"FilaMan: no extruder mapping for sensor '{sensor_name}', ignoring"
+                )
+                continue
+            if extruder in self.filament_sensors.values():
+                logging.warning(
+                    f"FilaMan: {extruder} already has a filament sensor, "
+                    f"ignoring '{sensor_name}'"
+                )
+                continue
+            self.filament_sensors[obj_name] = extruder
+
+        if self.filament_sensors:
+            mapping = ", ".join(
+                f"{obj.split(' ', 1)[1]} -> {extr}"
+                for obj, extr in self.filament_sensors.items()
+            )
+            logging.info(f"FilaMan tracking filament sensors: {mapping}")
+        else:
+            logging.info("FilaMan: no filament sensors found")
+
+    def _sensor_to_extruder(
+        self,
+        sensor_name: str,
+        known_extruders: set,
+    ) -> Optional[str]:
+        for extruder, mapped in self.sensor_map_override.items():
+            # Accept both the bare sensor name and the full Klipper object name.
+            if mapped.split(" ", 1)[-1] == sensor_name:
+                return extruder if extruder in known_extruders else None
+
+        name = sensor_name.lower()
+        index: Optional[int] = None
+        for pattern in (r"^e(\d+)", r"extruder(\d+)", r"^t(\d+)", r"(\d+)\D*$"):
+            match = re.search(pattern, name)
+            if match is not None:
+                index = int(match.group(1))
+                break
+        if index is None:
+            # An unnumbered sensor can only be attributed on a single-extruder printer.
+            index = 0 if len(known_extruders) == 1 else None
+        if index is None:
+            return None
+
+        extruder = "extruder" if index == 0 else f"extruder{index}"
+        return extruder if extruder in known_extruders else None
+
+    def _apply_sensor_states(
+        self,
+        status: Dict[str, Any],
+        initial: bool = False,
+    ) -> None:
+        for obj_name, extruder in self.filament_sensors.items():
+            sensor = status.get(obj_name)
+            if not isinstance(sensor, dict) or "filament_detected" not in sensor:
+                continue
+            self._note_filament_presence(
+                extruder, bool(sensor["filament_detected"]), initial
+            )
+
+    def _note_filament_presence(
+        self,
+        extruder: str,
+        present: bool,
+        initial: bool = False,
+    ) -> None:
+        if self.filament_present.get(extruder) == present:
             return
 
-        epos: float = toolhead.get("position", [0, 0, 0, self._highest_epos])[3]
-        self._last_epos = epos
-        extr = toolhead.get("extruder", self._current_extruder)
+        self.filament_present[extruder] = present
+        self.server.send_event(
+            "filaman:filament_presence_changed",
+            {
+                "extruder": extruder,
+                "filament_present": present,
+                "filament_present_map": self.filament_present,
+            },
+        )
 
-        if extr != self._current_extruder:
-            self._highest_epos = epos
-            self._current_extruder = extr
-            # Switch active spool to the one assigned to the new extruder
-            new_spool_id = self.extruder_spools.get(extr)
-            if new_spool_id != self.spool_id:
-                self.spool_id = new_spool_id
-                self.database.insert_item(DB_NAMESPACE, ACTIVE_SPOOL_KEY, new_spool_id)
-                self.database.insert_item(DB_NAMESPACE, LEGACY_ACTIVE_SPOOL_KEY, new_spool_id)
-                payload = {"spool_id": new_spool_id}
-                self.server.send_event("filaman:active_spool_set", payload)
-                self.server.send_event("spoolman:active_spool_set", payload)
-                logging.info(f"Toolchange to {extr}, switched to spool {new_spool_id}")
-        elif epos > self._highest_epos:
-            if self.spool_id is not None:
-                self._add_extrusion(self.spool_id, epos - self._highest_epos)
-            self._highest_epos = epos
+        if initial:
+            return
+
+        timer = self._runout_timers.pop(extruder, None)
+        if timer is not None:
+            timer.cancel()
+
+        if present or not self.clear_spool_on_runout:
+            return
+        if self.extruder_spools.get(extruder) is None:
+            return
+
+        logging.info(
+            f"Filament removed from {extruder}, releasing spool in "
+            f"{self.runout_debounce}s unless it returns"
+        )
+        self._runout_timers[extruder] = self.eventloop.delay_callback(
+            self.runout_debounce, self._handle_runout_confirmed, extruder
+        )
+
+    def _handle_runout_confirmed(self, extruder: str) -> None:
+        self._runout_timers.pop(extruder, None)
+        if self.filament_present.get(extruder) is not False:
+            return
+        spool_id = self.extruder_spools.get(extruder)
+        if spool_id is None:
+            return
+        logging.info(f"Releasing spool {spool_id} from empty {extruder}")
+        self.set_extruder_spool(extruder, None)
+
+    def _cancel_runout_timers(self) -> None:
+        for timer in self._runout_timers.values():
+            timer.cancel()
+        self._runout_timers = {}
 
     def _add_extrusion(self, spool_id: int, used_length_mm: float) -> None:
         if spool_id in self.pending_reports:
@@ -805,6 +973,8 @@ class FilaManManager:
             "pending_reports_count": len(pending),
             "spool_id": self.spool_id,
             "extruder_spools": self.extruder_spools,
+            "filament_present": self.filament_present,
+            "filament_sensors": self.filament_sensors,
             "last_error": self._last_error,
             "last_success_at": self._last_success_at,
         }
@@ -821,6 +991,7 @@ class FilaManManager:
         self.is_closing = True
         self.report_timer.stop()
         self._cancel_spool_check_task()
+        self._cancel_runout_timers()
 
         if self.connection_task is None or self.connection_task.done():
             return

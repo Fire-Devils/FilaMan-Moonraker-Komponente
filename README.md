@@ -9,6 +9,7 @@ Native Moonraker component for FilaMan.
 - Converts length (mm) to weight (g) using spool filament metadata
 - Reports usage to native FilaMan endpoint `/api/v1/spools/{id}/consumptions`
 - Uses PLA fallback density (`1.24 g/cm3`) when filament density is missing
+- Watches Klipper filament sensors and releases the spool when a toolhead runs empty
 - Spoolman-compatible aliases for endpoints/events/remote method are always enabled
 
 ## Configuration
@@ -31,6 +32,38 @@ default_diameter_mm: 1.75
 - `sync_rate` (optional): Report interval in seconds, default `5`
 - `default_density_g_cm3` (optional): fallback density, default `1.24`
 - `default_diameter_mm` (optional): fallback filament diameter, default `1.75`
+- `track_filament_sensors` (optional): watch Klipper filament sensors, default `True`
+- `clear_spool_on_runout` (optional): release the spool when the sensor reports no
+  filament, default `True`
+- `runout_debounce` (optional): seconds the sensor must stay empty before the spool is
+  released, default `1.0`
+- `filament_sensors` (optional): explicit extruder → sensor mapping, see below
+
+## Filament removal detection
+
+The component subscribes to every `filament_switch_sensor` / `filament_motion_sensor`
+object Klipper exposes — the same sensors fluidd lists under *Runout sensors*. Sensors
+are mapped to extruders by name (`e0_filament` → `extruder`, `e1_filament` →
+`extruder1`, …). When a sensor reports `filament_detected: false`, the spool assigned to
+that extruder is released after `runout_debounce` seconds: usage tracking stops, the
+FilaMan card shows no spool, and the printer channel is cleared via
+`filament_detect/set`.
+
+If the naming heuristic does not fit your printer, map the sensors explicitly:
+
+```ini
+[filaman]
+filament_sensors:
+    extruder = e0_filament
+    extruder1 = e1_filament
+    extruder2 = e2_filament
+    extruder3 = e3_filament
+```
+
+The detected mapping is logged to `moonraker.log` on startup and returned by
+`GET /server/filaman/status` as `filament_sensors`, alongside the current per-extruder
+state in `filament_present`. Changes are pushed as the
+`filaman:filament_presence_changed` notification.
 
 ## Endpoints
 
