@@ -1,5 +1,7 @@
 # FilaMan Moonraker Component
 
+*[Deutsche Version](README.de.md)*
+
 Native Moonraker component for FilaMan.
 
 ## Features
@@ -53,8 +55,7 @@ FilaMan instance under **Admin → user settings → API Keys**. A valid key loo
 
 > **Not the device tokens.** The *Device tokens* in the admin panel are a different
 > credential and will not authenticate this component — requests keep failing without an
-> obvious error. This is the most common setup mistake, see
-> [issue #1](https://github.com/ManuelW77/FilaMan-Moonraker-Komponente/issues/1).
+> obvious error. This is the most common setup mistake.
 
 If the key is wrong or missing, `GET /server/filaman/status` reports the problem in
 `last_error` and `filaman_connected` stays `false`. The resolved API URL is logged to
@@ -62,8 +63,7 @@ If the key is wrong or missing, `GET /server/filaman/status` reports the problem
 
 ### Keeping credentials in moonraker.secrets
 
-`server` and `api_key` accept Moonraker's secret placeholders
-([issue #2](https://github.com/ManuelW77/FilaMan-Moonraker-Komponente/issues/2)):
+`server` and `api_key` accept Moonraker's secret placeholders:
 
 ```ini
 # moonraker.conf
@@ -88,15 +88,42 @@ option, instead of silently leaving the printer disconnected.
 
 ## Filament removal detection
 
-The component subscribes to every `filament_switch_sensor` / `filament_motion_sensor`
-object Klipper exposes — the same sensors fluidd lists under *Runout sensors*. Sensors
-are mapped to extruders by name (`e0_filament` → `extruder`, `e1_filament` →
-`extruder1`, …). When a sensor reports `filament_detected: false`, the spool assigned to
-that extruder is released after `runout_debounce` seconds: usage tracking stops, the
-FilaMan card shows no spool, and the printer channel is cleared via
-`filament_detect/set`.
+When a sensor reports `filament_detected: false`, the spool assigned to that extruder is
+released after `runout_debounce` seconds: usage tracking stops, the FilaMan card shows no
+spool, and the printer channel is cleared via `filament_detect/set`. A toolhead already
+empty while Klipper starts up is released immediately — a startup snapshot cannot
+flicker.
 
-If the naming heuristic does not fit your printer, map the sensors explicitly:
+Every sensor has to belong to an extruder for this to work. Each sensor is assigned
+either automatically or manually.
+
+### Automatic assignment
+
+On every Klipper restart the component lists all `filament_switch_sensor` and
+`filament_motion_sensor` objects — the same sensors fluidd lists under *Runout sensors* —
+and derives an extruder from each sensor name. The first matching rule wins,
+case-insensitively:
+
+| Rule | Matches | Example |
+| --- | --- | --- |
+| Leading `e` + number | `^e(\d+)` | `e0_filament` → `extruder` |
+| `extruder` + number | `extruder(\d+)` | `extruder1_runout` → `extruder1` |
+| Leading `T` + number | `^t(\d+)` | `T2_sensor` → `extruder2` |
+| Trailing number | `(\d+)\D*$` | `filament_sensor_1` → `extruder1` |
+
+Index `0` maps to `extruder`, every other index `N` to `extruderN`. A sensor without any
+number is only assigned on a printer that has exactly one extruder.
+
+Two safeguards keep a wrong guess from doing damage: a sensor is ignored when the derived
+extruder does not exist on the printer, and when an extruder already has a sensor the
+later one is ignored with a warning. So an ambiguous name on a multi-extruder printer is
+skipped rather than attached to the wrong toolhead.
+
+### Manual assignment
+
+If the naming on your printer does not fit those rules, map the sensors yourself with
+`filament_sensors`. It takes one `extruder = sensor` line per toolhead and overrides the
+automatic rules:
 
 ```ini
 [filaman]
@@ -107,13 +134,23 @@ filament_sensors:
     extruder3 = e3_filament
 ```
 
-The detected mapping is logged to `moonraker.log` on startup and returned by
+The sensor may be written as the bare name (`e0_filament`) or as the full Klipper object
+name (`filament_motion_sensor e0_filament`). Sensors you do not list still go through the
+automatic rules, so partial mappings are fine. Set `track_filament_sensors: False` to
+switch the whole feature off.
+
+### Checking the result
+
+Whichever way the mapping was produced, it is logged to `moonraker.log` on startup:
+
+```
+FilaMan tracking filament sensors: e0_filament -> extruder, e1_filament -> extruder1
+```
+
+Sensors that could not be assigned are logged too. The same mapping is returned by
 `GET /server/filaman/status` as `filament_sensors`, alongside the current per-extruder
 state in `filament_present`. Changes are pushed as the
 `filaman:filament_presence_changed` notification.
-
-A toolhead reported as empty while Klipper starts up releases its spool immediately
-rather than after `runout_debounce` — a startup snapshot cannot flicker.
 
 ## Keeping the printer in sync
 
@@ -154,6 +191,10 @@ Additional Spoolman aliases are always available:
 
 ## GCode macro examples
 
+The remote methods above are callable from Klipper, which lets you assign a spool from
+GCode instead of the web UI — from a slicer's start GCode, a printer touchscreen button,
+or a `SET_ACTIVE_SPOOL ID=42` console command. Add these to `printer.cfg`:
+
 ```ini
 [gcode_macro SET_ACTIVE_SPOOL]
 gcode:
@@ -168,3 +209,14 @@ gcode:
 gcode:
   {action_call_remote_method("filaman_set_active_spool", spool_id=None)}
 ```
+
+Both act on the **currently active extruder** only. On a multi-extruder printer you
+therefore have to select the toolhead first (`T1`, then `SET_ACTIVE_SPOOL ID=42`), or
+address an extruder directly over HTTP, which needs no tool change:
+
+```
+POST /server/filaman/spool_id?extruder=extruder1&spool_id=42
+```
+
+The macros are entirely optional — assigning spools from the FilaMan card in fluidd uses
+the same endpoints.
