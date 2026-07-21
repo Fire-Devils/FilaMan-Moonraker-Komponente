@@ -37,6 +37,11 @@ DEFAULT_FILAMENT_DIAMETER_MM = 1.75
 # filament_detect.state[channel]: the printer is asking for filament info
 FILAMENT_DT_STATE_DETECTING = 1
 
+# Moonraker renders config templates with '{' / '}' as the Jinja variable
+# delimiters, so a literal brace in a plain value would be stripped. Only
+# expand options that actually reference a template.
+TEMPLATE_HINT_RE = re.compile(r"\{%|\{\s*secrets\b")
+
 
 class FilaManManager:
     def __init__(self, config: ConfigHelper):
@@ -44,7 +49,7 @@ class FilaManManager:
         self.eventloop = self.server.get_event_loop()
 
         self._get_filaman_urls(config)
-        self.api_key: Optional[str] = config.get("api_key", default=None)
+        self.api_key: Optional[str] = self._get_templated_option(config, "api_key")
         self.sync_rate_seconds = config.getint("sync_rate", default=5, minval=1)
         self.reconnect_delay: float = 2.0
         self.connected_check_delay: float = 30.0
@@ -164,8 +169,36 @@ class FilaManManager:
             )
         return value
 
+    def _get_templated_option(
+        self,
+        config: ConfigHelper,
+        option: str,
+        default: Optional[str] = None,
+    ) -> Optional[str]:
+        """Resolve an option, expanding `{secrets.section.key}` placeholders.
+
+        Anything that does not reference a template is taken verbatim, so a
+        token containing a literal brace survives unchanged.
+        """
+        raw = config.get(option, default=None)
+        if raw is None:
+            return default
+        if TEMPLATE_HINT_RE.search(raw) is None:
+            return raw.strip() or default
+
+        value = config.gettemplate(option).render()
+        if not value:
+            raise config.error(
+                f"Section [filaman], Option {option}: '{raw}' resolved to an "
+                "empty value. Check that the referenced entry exists in "
+                "moonraker.secrets."
+            )
+        return value
+
     def _get_filaman_urls(self, config: ConfigHelper) -> None:
-        orig_url = config.get("server")
+        orig_url = self._get_templated_option(config, "server")
+        if orig_url is None:
+            raise config.error("Section [filaman], Option server: value is required")
         if not re.match(r"(?i)^https?://", orig_url):
             orig_url = f"http://{orig_url}"
         parsed = urlparse(orig_url)
@@ -188,6 +221,9 @@ class FilaManManager:
 
         self.server_url = f"{base}{server_path}"
         self.api_url = f"{base}{api_path}"
+        # Logged so a misconfigured server option is visible without guessing,
+        # e.g. when an unresolved secret leaves a placeholder in the host name.
+        logging.info(f"FilaMan API URL: {self.api_url}")
 
     def _register_notifications(self) -> None:
         self._register_notification_safe("filaman:active_spool_set")

@@ -57,7 +57,34 @@ FilaMan instance under **Admin → user settings → API Keys**. A valid key loo
 > [issue #1](https://github.com/ManuelW77/FilaMan-Moonraker-Komponente/issues/1).
 
 If the key is wrong or missing, `GET /server/filaman/status` reports the problem in
-`last_error` and `filaman_connected` stays `false`.
+`last_error` and `filaman_connected` stays `false`. The resolved API URL is logged to
+`moonraker.log` on startup.
+
+### Keeping credentials in moonraker.secrets
+
+`server` and `api_key` accept Moonraker's secret placeholders
+([issue #2](https://github.com/ManuelW77/FilaMan-Moonraker-Komponente/issues/2)):
+
+```ini
+# moonraker.conf
+[secrets]
+
+[filaman]
+server: {secrets.filaman.server}
+api_key: {secrets.filaman.api_key}
+```
+
+```ini
+# moonraker.secrets
+[filaman]
+server: http://192.168.1.50:8000
+api_key: uak.1.xxxxxxxxxxxxxxxxxxxxx
+```
+
+Only these two options are expanded, and only when the value actually references a
+template — a plain key containing a literal `{` is passed through untouched. A
+placeholder pointing at a missing entry aborts startup with a config error naming the
+option, instead of silently leaving the printer disconnected.
 
 ## Filament removal detection
 
