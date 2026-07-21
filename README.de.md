@@ -94,12 +94,30 @@ Konfigurationsfehler ab, der die Option benennt, statt den Drucker still auf
 
 Meldet ein Sensor `filament_detected: false`, wird die dem Extruder zugewiesene Spule nach
 `runout_debounce` Sekunden freigegeben: Die Verbrauchsbuchung stoppt, die FilaMan-Karte
-zeigt keine Spule mehr, und der Druckerkanal wird über `filament_detect/set` geleert. Ein
-Toolhead, der beim Start von Klipper bereits leer ist, wird sofort freigegeben — eine
-Momentaufnahme beim Start kann nicht flackern.
+zeigt keine Spule mehr, und der Druckerkanal wird über `filament_detect/set` geleert.
 
 Damit das funktioniert, muss jeder Sensor einem Extruder zugeordnet sein. Diese Zuordnung
 geschieht entweder automatisch oder manuell.
+
+### Belegung beim Start
+
+Ein `filament_motion_sensor` meldet `filament_detected: false`, solange sein Encoder keine
+Bewegung gesehen hat — `RunoutHelper` startet mit `False`, und der initiale Pin-Zustand
+wird nie gemeldet. Direkt nach dem Einschalten bedeutet `false` also *noch nicht gemessen*
+und nicht *leer*. Die Komponente wertet ein `false` vom Sensor beim Start deshalb als
+**unbekannt** und gibt darauf niemals eine Spule frei; es zählt nur ein `true` oder ein
+späterer Wechsel im laufenden Betrieb.
+
+Stellt der Drucker `print_task_config.filament_exist` bereit (Snapmaker U1), wird dieses
+Array stattdessen als maßgebliche Belegung genutzt. Es ist schon beim Start gültig und ist
+die Quelle, die auch das Drucker-Display anzeigt. Ein Toolhead, der im ausgeschalteten
+Zustand geleert wurde, wird damit weiterhin erkannt und freigegeben. Ohne dieses Objekt
+bleibt die Belegung schlicht unbekannt, bis der Sensor etwas meldet.
+
+„Unbekannt" blockiert nichts: Spulen werden weiterhin an den Drucker nachgeschoben, und
+nur ein *bestätigt* leerer Kanal wird übersprungen. `GET /server/filaman/status` liefert
+die zusammengeführte Belegung `filament_present` (`true` / `false` / `null`) sowie die
+Rohwerte in `sensor_present` und `printer_present`.
 
 ### Automatische Zuordnung
 

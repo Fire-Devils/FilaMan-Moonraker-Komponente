@@ -42,6 +42,10 @@ FILAMENT_DT_STATE_DETECTING = 1
 # expand options that actually reference a template.
 TEMPLATE_HINT_RE = re.compile(r"\{%|\{\s*secrets\b")
 
+# Distinguishes "argument not supplied" from None, which means "unknown" for
+# filament presence.
+_UNSET: Any = object()
+
 
 class FilaManManager:
     def __init__(self, config: ConfigHelper):
@@ -105,11 +109,15 @@ class FilaManManager:
 
         # Klipper object name ("filament_switch_sensor e0_filament") -> extruder name
         self.filament_sensors: Dict[str, str] = {}
-        self.filament_present: Dict[str, bool] = {}
+        # Tri-state per extruder: True loaded, False confirmed empty, None unknown.
+        self.filament_present: Dict[str, Optional[bool]] = {}
+        self._sensor_present: Dict[str, Optional[bool]] = {}
+        self._printer_present: Dict[str, Optional[bool]] = {}
         self._runout_timers: Dict[str, asyncio.TimerHandle] = {}
 
         self._filament_detect_state: Dict[int, int] = {}
         self._has_filament_detect: bool = False
+        self._has_print_task_config: bool = False
         self._repush_timer: Optional[asyncio.TimerHandle] = None
 
         self._error_logged: bool = False
@@ -341,10 +349,13 @@ class FilaManManager:
         self._cancel_repush_timer()
         self.filament_sensors = {}
         self.filament_present = {}
+        self._sensor_present = {}
+        self._printer_present = {}
         self._filament_detect_state = {}
 
         objects_list: List[str] = await self.klippy_apis.get_object_list(default=[])
         self._has_filament_detect = "filament_detect" in objects_list
+        self._has_print_task_config = "print_task_config" in objects_list
         if self.track_filament_sensors:
             self._discover_filament_sensors(objects_list)
 
@@ -355,6 +366,8 @@ class FilaManManager:
             objects[obj_name] = ["filament_detected"]
         if self._has_filament_detect and self.respond_to_filament_requests:
             objects["filament_detect"] = ["state"]
+        if self._has_print_task_config:
+            objects["print_task_config"] = ["filament_exist"]
 
         result: Dict[str, Dict[str, Any]]
         result = await self.klippy_apis.subscribe_objects(
@@ -388,6 +401,7 @@ class FilaManManager:
         # Evaluated last: releasing a spool needs both the restored assignments
         # and _last_epos, and the re-push must see the cleaned up state.
         self._apply_sensor_states(result, initial=True)
+        self._apply_filament_exist(result, initial=True)
         self._apply_filament_detect_state(result)
         if self.repush_on_startup:
             self._repush_timer = self.eventloop.delay_callback(
@@ -422,6 +436,7 @@ class FilaManManager:
                 self._highest_epos = epos
 
         self._apply_sensor_states(status)
+        self._apply_filament_exist(status)
         self._apply_filament_detect_state(status)
 
     # ------------------------------------------------------------------ #
@@ -498,16 +513,52 @@ class FilaManManager:
             sensor = status.get(obj_name)
             if not isinstance(sensor, dict) or "filament_detected" not in sensor:
                 continue
-            self._note_filament_presence(
-                extruder, bool(sensor["filament_detected"]), initial
-            )
+            detected = bool(sensor["filament_detected"])
+            if initial and not detected:
+                # A motion sensor reports False until its encoder has seen
+                # movement, so a startup 'false' means "not measured yet"
+                # rather than "empty". Record it as unknown.
+                detected = None
+            self._update_presence(extruder, sensor=detected, initial=initial)
 
-    def _note_filament_presence(
+    def _apply_filament_exist(
         self,
-        extruder: str,
-        present: bool,
+        status: Dict[str, Any],
         initial: bool = False,
     ) -> None:
+        """Apply print_task_config.filament_exist, the printer's own occupancy."""
+        task_config = status.get("print_task_config")
+        if not isinstance(task_config, dict):
+            return
+        exist = task_config.get("filament_exist")
+        if not isinstance(exist, list):
+            return
+
+        for channel, present in enumerate(exist):
+            extruder = "extruder" if channel == 0 else f"extruder{channel}"
+            self._update_presence(extruder, printer=bool(present), initial=initial)
+
+    def _update_presence(
+        self,
+        extruder: str,
+        sensor: Any = _UNSET,
+        printer: Any = _UNSET,
+        initial: bool = False,
+    ) -> None:
+        """Merge both presence sources and act when a toolhead is confirmed empty.
+
+        filament_exist wins over the runout sensor: it is what the printer's own
+        display uses and it is already valid at startup.
+        """
+        if sensor is not _UNSET:
+            self._sensor_present[extruder] = sensor
+        if printer is not _UNSET:
+            self._printer_present[extruder] = printer
+
+        present = self._printer_present.get(extruder)
+        if present is None:
+            present = self._sensor_present.get(extruder)
+
         if self.filament_present.get(extruder) == present:
             return
 
@@ -525,7 +576,8 @@ class FilaManManager:
         if timer is not None:
             timer.cancel()
 
-        if present or not self.clear_spool_on_runout:
+        # Only a confirmed empty releases the spool; unknown never does.
+        if present is not False or not self.clear_spool_on_runout:
             return
         if self.extruder_spools.get(extruder) is None:
             return
@@ -1091,6 +1143,8 @@ class FilaManManager:
             "spool_id": self.spool_id,
             "extruder_spools": self.extruder_spools,
             "filament_present": self.filament_present,
+            "sensor_present": self._sensor_present,
+            "printer_present": self._printer_present,
             "filament_sensors": self.filament_sensors,
             "filament_detect_state": self._filament_detect_state,
             "last_error": self._last_error,

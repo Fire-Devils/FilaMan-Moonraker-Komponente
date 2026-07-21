@@ -90,12 +90,29 @@ option, instead of silently leaving the printer disconnected.
 
 When a sensor reports `filament_detected: false`, the spool assigned to that extruder is
 released after `runout_debounce` seconds: usage tracking stops, the FilaMan card shows no
-spool, and the printer channel is cleared via `filament_detect/set`. A toolhead already
-empty while Klipper starts up is released immediately — a startup snapshot cannot
-flicker.
+spool, and the printer channel is cleared via `filament_detect/set`.
 
 Every sensor has to belong to an extruder for this to work. Each sensor is assigned
 either automatically or manually.
+
+### Occupancy at startup
+
+A `filament_motion_sensor` reports `filament_detected: false` until its encoder has seen
+movement — `RunoutHelper` starts out `False` and the initial pin state is never reported.
+Right after a power cycle, `false` therefore means *not measured yet*, not *empty*. The
+component treats a sensor's `false` at startup as **unknown** and never releases a spool
+on it; only a `true`, or a later change during operation, counts.
+
+Where the printer exposes `print_task_config.filament_exist` (Snapmaker U1), that array is
+used as the authoritative occupancy instead. It is valid immediately at startup and is
+what the printer's own display shows, so a toolhead emptied while the printer was off is
+still detected and released. Without that object, occupancy simply stays unknown until the
+sensor reports something.
+
+Unknown never blocks anything: spools are still re-pushed to the printer, and only a
+*confirmed* empty channel is skipped. `GET /server/filaman/status` exposes the merged
+`filament_present` (`true` / `false` / `null`) plus the raw `sensor_present` and
+`printer_present` maps.
 
 ### Automatic assignment
 
