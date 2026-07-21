@@ -34,6 +34,9 @@ EXTRUDER_SPOOLS_KEY = "filaman.extruder_spools"
 DEFAULT_PLA_DENSITY_G_CM3 = 1.24
 DEFAULT_FILAMENT_DIAMETER_MM = 1.75
 
+# filament_detect.state[channel]: the printer is asking for filament info
+FILAMENT_DT_STATE_DETECTING = 1
+
 
 class FilaManManager:
     def __init__(self, config: ConfigHelper):
@@ -57,6 +60,15 @@ class FilaManManager:
         )
         self.sensor_map_override: Dict[str, str] = config.getdict(
             "filament_sensors", default={}
+        )
+        self.respond_to_filament_requests: bool = config.getboolean(
+            "respond_to_filament_requests", default=True
+        )
+        self.repush_on_startup: bool = config.getboolean(
+            "repush_on_startup", default=True
+        )
+        self.repush_delay: float = config.getfloat(
+            "repush_delay", default=3.0, minval=0.0
         )
 
         self.default_density_g_cm3 = self._get_float_option(
@@ -90,6 +102,10 @@ class FilaManManager:
         self.filament_sensors: Dict[str, str] = {}
         self.filament_present: Dict[str, bool] = {}
         self._runout_timers: Dict[str, asyncio.TimerHandle] = {}
+
+        self._filament_detect_state: Dict[int, int] = {}
+        self._has_filament_detect: bool = False
+        self._repush_timer: Optional[asyncio.TimerHandle] = None
 
         self._error_logged: bool = False
         self._last_error: Optional[str] = None
@@ -284,24 +300,30 @@ class FilaManManager:
         return self.api_connected
 
     async def _handle_klippy_ready(self) -> None:
-        # Klippy may reconnect at any time, so rebuild the sensor state from scratch.
+        # Klippy may reconnect at any time, so rebuild the printer state from scratch.
         self._cancel_runout_timers()
+        self._cancel_repush_timer()
         self.filament_sensors = {}
         self.filament_present = {}
+        self._filament_detect_state = {}
+
+        objects_list: List[str] = await self.klippy_apis.get_object_list(default=[])
+        self._has_filament_detect = "filament_detect" in objects_list
         if self.track_filament_sensors:
-            await self._discover_filament_sensors()
+            self._discover_filament_sensors(objects_list)
 
         objects: Dict[str, Optional[List[str]]] = {
             "toolhead": ["position", "extruder"]
         }
         for obj_name in self.filament_sensors:
             objects[obj_name] = ["filament_detected"]
+        if self._has_filament_detect and self.respond_to_filament_requests:
+            objects["filament_detect"] = ["state"]
 
         result: Dict[str, Dict[str, Any]]
         result = await self.klippy_apis.subscribe_objects(
             objects, self._handle_status_update, {}
         )
-        self._apply_sensor_states(result, initial=True)
         toolhead = result.get("toolhead", {})
         self._current_extruder = toolhead.get("extruder", "extruder")
         initial_e_pos = toolhead.get("position", [None] * 4)[3]
@@ -325,6 +347,15 @@ class FilaManManager:
             self.database.insert_item(DB_NAMESPACE, EXTRUDER_SPOOLS_KEY, self.extruder_spools)
             logging.info(
                 f"Migrated legacy spool_id {self.spool_id} to extruder {self._current_extruder}"
+            )
+
+        # Evaluated last: releasing a spool needs both the restored assignments
+        # and _last_epos, and the re-push must see the cleaned up state.
+        self._apply_sensor_states(result, initial=True)
+        self._apply_filament_detect_state(result)
+        if self.repush_on_startup:
+            self._repush_timer = self.eventloop.delay_callback(
+                self.repush_delay, self._repush_assigned_spools
             )
 
     def _handle_status_update(self, status: Dict[str, Any], _: float) -> None:
@@ -355,13 +386,13 @@ class FilaManManager:
                 self._highest_epos = epos
 
         self._apply_sensor_states(status)
+        self._apply_filament_detect_state(status)
 
     # ------------------------------------------------------------------ #
     # Filament runout sensors: detect a toolhead running empty            #
     # ------------------------------------------------------------------ #
 
-    async def _discover_filament_sensors(self) -> None:
-        objects: List[str] = await self.klippy_apis.get_object_list(default=[])
+    def _discover_filament_sensors(self, objects: List[str]) -> None:
         known_extruders = {
             name for name in objects
             if name == "extruder" or re.match(r"^extruder\d+$", name)
@@ -454,9 +485,6 @@ class FilaManManager:
             },
         )
 
-        if initial:
-            return
-
         timer = self._runout_timers.pop(extruder, None)
         if timer is not None:
             timer.cancel()
@@ -464,6 +492,11 @@ class FilaManManager:
         if present or not self.clear_spool_on_runout:
             return
         if self.extruder_spools.get(extruder) is None:
+            return
+
+        if initial:
+            # A startup snapshot cannot flicker, so act on it right away.
+            self._handle_runout_confirmed(extruder)
             return
 
         logging.info(
@@ -488,6 +521,54 @@ class FilaManManager:
         for timer in self._runout_timers.values():
             timer.cancel()
         self._runout_timers = {}
+
+    # ------------------------------------------------------------------ #
+    # Printer requests: filament_detect.state -> re-push assigned spools  #
+    # ------------------------------------------------------------------ #
+
+    def _apply_filament_detect_state(self, status: Dict[str, Any]) -> None:
+        detect = status.get("filament_detect")
+        if not isinstance(detect, dict):
+            return
+        state = detect.get("state")
+        if not isinstance(state, list):
+            return
+
+        for channel, value in enumerate(state):
+            previous = self._filament_detect_state.get(channel)
+            self._filament_detect_state[channel] = value
+            if value != FILAMENT_DT_STATE_DETECTING or previous == value:
+                continue
+            self._handle_filament_request(channel)
+
+    def _handle_filament_request(self, channel: int) -> None:
+        extruder = "extruder" if channel == 0 else f"extruder{channel}"
+        spool_id = self.extruder_spools.get(extruder)
+        if spool_id is None:
+            # Leave the channel to the RFID reader rather than acknowledging it
+            # with an empty payload, which would wipe whatever it just read.
+            return
+        if self.filament_present.get(extruder) is False:
+            return
+
+        logging.info(
+            f"Printer requested filament info for channel {channel}, "
+            f"answering with spool {spool_id} of {extruder}"
+        )
+        self.eventloop.create_task(self._push_spool_to_printer(extruder, spool_id))
+
+    def _repush_assigned_spools(self) -> None:
+        self._repush_timer = None
+        for extruder, spool_id in self.extruder_spools.items():
+            if spool_id is None or self.filament_present.get(extruder) is False:
+                continue
+            logging.info(f"Re-pushing spool {spool_id} of {extruder} to the printer")
+            self.eventloop.create_task(self._push_spool_to_printer(extruder, spool_id))
+
+    def _cancel_repush_timer(self) -> None:
+        if self._repush_timer is not None:
+            self._repush_timer.cancel()
+            self._repush_timer = None
 
     def _add_extrusion(self, spool_id: int, used_length_mm: float) -> None:
         if spool_id in self.pending_reports:
@@ -975,6 +1056,7 @@ class FilaManManager:
             "extruder_spools": self.extruder_spools,
             "filament_present": self.filament_present,
             "filament_sensors": self.filament_sensors,
+            "filament_detect_state": self._filament_detect_state,
             "last_error": self._last_error,
             "last_success_at": self._last_success_at,
         }
@@ -992,6 +1074,7 @@ class FilaManManager:
         self.report_timer.stop()
         self._cancel_spool_check_task()
         self._cancel_runout_timers()
+        self._cancel_repush_timer()
 
         if self.connection_task is None or self.connection_task.done():
             return

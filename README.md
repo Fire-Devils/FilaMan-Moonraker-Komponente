@@ -38,6 +38,11 @@ default_diameter_mm: 1.75
 - `runout_debounce` (optional): seconds the sensor must stay empty before the spool is
   released, default `1.0`
 - `filament_sensors` (optional): explicit extruder → sensor mapping, see below
+- `respond_to_filament_requests` (optional): answer `filament_detect.state` requests from
+  the printer, default `True`
+- `repush_on_startup` (optional): re-send all assigned spools to the printer once after
+  Klipper becomes ready, default `True`
+- `repush_delay` (optional): seconds to wait before that re-push, default `3.0`
 
 ## Filament removal detection
 
@@ -64,6 +69,27 @@ The detected mapping is logged to `moonraker.log` on startup and returned by
 `GET /server/filaman/status` as `filament_sensors`, alongside the current per-extruder
 state in `filament_present`. Changes are pushed as the
 `filaman:filament_presence_changed` notification.
+
+A toolhead reported as empty while Klipper starts up releases its spool immediately
+rather than after `runout_debounce` — a startup snapshot cannot flicker.
+
+## Keeping the printer in sync
+
+Printers exposing a `filament_detect` object (Snapmaker U1) lose their filament info on
+power cycle. Two mechanisms restore it:
+
+- **On request:** the component subscribes to `filament_detect.state`. A value of `1` for
+  a channel means the printer is asking for filament info, and the component answers with
+  the spool assigned to that extruder (channel 0 → `extruder`, channel 1 → `extruder1`, …).
+  Channels without a FilaMan assignment are deliberately left alone, so a parallel RFID
+  read is never overwritten with an empty payload.
+- **On startup:** `repush_delay` seconds after Klipper becomes ready, every assigned spool
+  is sent to the printer once. Extruders whose sensor reports no filament are skipped. The
+  delay gives the printer's own RFID scan a head start.
+
+Both can be turned off via `respond_to_filament_requests` and `repush_on_startup`. The
+last seen state array is exposed as `filament_detect_state` by
+`GET /server/filaman/status`.
 
 ## Endpoints
 
