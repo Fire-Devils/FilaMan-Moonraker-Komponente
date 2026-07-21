@@ -28,7 +28,8 @@ default_diameter_mm: 1.75
 ### Options
 
 - `server` (required): Base URL of your FilaMan instance
-- `api_key` (recommended): FilaMan API key token (`uak.<id>.<secret>`)
+- `api_key` (recommended): FilaMan API key token (`uak.<id>.<secret>`), see
+  [Where to get the API key](#where-to-get-the-api-key)
 - `sync_rate` (optional): Report interval in seconds, default `5`
 - `default_density_g_cm3` (optional): fallback density, default `1.24`
 - `default_diameter_mm` (optional): fallback filament diameter, default `1.75`
@@ -43,6 +44,20 @@ default_diameter_mm: 1.75
 - `repush_on_startup` (optional): re-send all assigned spools to the printer once after
   Klipper becomes ready, default `True`
 - `repush_delay` (optional): seconds to wait before that re-push, default `3.0`
+
+### Where to get the API key
+
+The `api_key` is issued by **FilaMan**, not by Moonraker or Klipper. Create it in your
+FilaMan instance under **Admin → user settings → API Keys**. A valid key looks like
+`uak.<id>.<secret>`.
+
+> **Not the device tokens.** The *Device tokens* in the admin panel are a different
+> credential and will not authenticate this component — requests keep failing without an
+> obvious error. This is the most common setup mistake, see
+> [issue #1](https://github.com/ManuelW77/FilaMan-Moonraker-Komponente/issues/1).
+
+If the key is wrong or missing, `GET /server/filaman/status` reports the problem in
+`last_error` and `filaman_connected` stays `false`.
 
 ## Filament removal detection
 
