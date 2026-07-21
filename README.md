@@ -14,6 +14,64 @@ Native Moonraker component for FilaMan.
 - Watches Klipper filament sensors and releases the spool when a toolhead runs empty
 - Spoolman-compatible aliases for endpoints/events/remote method are always enabled
 
+## Installing on the Snapmaker U1
+
+Out of the box the U1 allows no SSH access, and files you add do not survive a reboot. Two
+preparation steps are therefore required before installing this component: the custom
+firmware and debug mode.
+
+### 1. Flash the paxx12 custom firmware
+
+The component requires the
+[SnapmakerU1 Extended Firmware](https://github.com/paxx12-snapmaker-u1/SnapmakerU1-Extended-Firmware),
+which enables SSH access. Copy the `.bin` onto a FAT32-formatted USB drive and install it
+on the printer via **About → Firmware version → Local Update**; the
+[installation guide](https://snapmakeru1-extended-firmware.pages.dev/install.html)
+covers this in detail.
+
+The printer is then reachable over SSH (port 22, user `root` or `lava`, password
+`snapmaker`):
+
+```bash
+ssh lava@<printer-ip>
+```
+
+> This is root access with a default password. Only use it on a trusted network, and
+> change the password after the first login.
+
+### 2. Enable debug mode
+
+Without debug mode the filesystem is reset on every reboot — the component you copied
+would be gone the next time the printer starts. Debug mode is enabled by an empty `.debug`
+file:
+
+```bash
+touch /oem/.debug
+reboot
+```
+
+> Switching to debug mode resets the Wi-Fi settings. The printer has to be reconnected to
+> your Wi-Fi once afterwards.
+
+### 3. Upload the component
+
+Copy `filaman.py` into Moonraker's components directory over SSH:
+
+```bash
+scp filaman.py lava@<printer-ip>:/home/lava/moonraker/moonraker/components/
+```
+
+Then add the `[filaman]` section to `moonraker.conf` (see
+[Configuration](#configuration)) and restart Moonraker. Whether the component loaded is
+reported in `moonraker.log` and by `GET /server/filaman/status`.
+
+### 4. Optional: FilaMan card in the printer's frontend
+
+The component works fine without any web UI. To also see the FilaMan card in the printer's
+fluidd and assign spools there, you additionally need the modified fluidd carrying the
+FilaMan module: [ManuelW77/fluidd](https://github.com/ManuelW77/fluidd). The U1's stock
+fluidd keeps working without this swap, it just does not show the card.
+
 ## Configuration
 
 Add this section to `moonraker.conf`:

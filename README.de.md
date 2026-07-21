@@ -15,6 +15,66 @@ Native Moonraker-Komponente für FilaMan.
   leer läuft
 - Spoolman-kompatible Aliasse für Endpoints, Events und Remote-Methode sind immer aktiv
 
+## Installation auf dem Snapmaker U1
+
+Der U1 lässt in seinem Auslieferungszustand weder SSH zu, noch überleben eigene Dateien
+einen Neustart. Für diese Komponente sind deshalb zwei Vorarbeiten nötig: die
+Custom-Firmware und der Debug-Modus.
+
+### 1. Custom-Firmware von paxx12 aufspielen
+
+Die Komponente setzt die
+[SnapmakerU1 Extended Firmware](https://github.com/paxx12-snapmaker-u1/SnapmakerU1-Extended-Firmware)
+voraus — sie schaltet den SSH-Zugang frei. Die `.bin` auf einen FAT32-formatierten
+USB-Stick kopieren und am Drucker über **About → Firmware version → Local Update**
+einspielen; die
+[Installationsanleitung](https://snapmakeru1-extended-firmware.pages.dev/install.html)
+beschreibt das im Detail.
+
+Danach ist der Drucker per SSH erreichbar (Port 22, Benutzer `root` oder `lava`, Passwort
+`snapmaker`):
+
+```bash
+ssh lava@<drucker-ip>
+```
+
+> Das ist ein Root-Zugang mit Standardpasswort. Nur in einem vertrauenswürdigen Netz
+> verwenden und das Passwort nach dem ersten Login ändern.
+
+### 2. Debug-Modus aktivieren
+
+Ohne Debug-Modus wird das Dateisystem bei jedem Neustart zurückgesetzt — die kopierte
+Komponente wäre nach dem nächsten Einschalten wieder verschwunden. Der Debug-Modus wird
+über eine leere Datei `.debug` eingeschaltet:
+
+```bash
+touch /oem/.debug
+reboot
+```
+
+> Der Wechsel in den Debug-Modus setzt die WLAN-Einstellungen zurück. Der Drucker muss
+> danach einmalig neu mit dem WLAN verbunden werden.
+
+### 3. Komponente hochladen
+
+`filaman.py` per SSH in das Komponenten-Verzeichnis von Moonraker kopieren:
+
+```bash
+scp filaman.py lava@<drucker-ip>:/home/lava/moonraker/moonraker/components/
+```
+
+Anschließend den `[filaman]`-Abschnitt in die `moonraker.conf` eintragen (siehe
+[Konfiguration](#konfiguration)) und Moonraker neu starten. Ob die Komponente geladen
+wurde, steht in der `moonraker.log` und in `GET /server/filaman/status`.
+
+### 4. Optional: FilaMan-Karte im Drucker-Frontend
+
+Die Komponente arbeitet vollständig ohne Weboberfläche. Wer die FilaMan-Karte auch im
+fluidd des Druckers sehen und Spulen dort zuweisen möchte, braucht zusätzlich das
+modifizierte fluidd mit dem FilaMan-Modul:
+[ManuelW77/fluidd](https://github.com/ManuelW77/fluidd). Das Standard-fluidd des U1 bleibt
+ohne diesen Austausch funktionsfähig, zeigt die Karte aber nicht an.
+
 ## Konfiguration
 
 Diesen Abschnitt in die `moonraker.conf` eintragen:
