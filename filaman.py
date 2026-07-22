@@ -37,6 +37,12 @@ DEFAULT_FILAMENT_DIAMETER_MM = 1.75
 # filament_detect.state[channel]: the printer is asking for filament info
 FILAMENT_DT_STATE_DETECTING = 1
 
+# A spool lookup on the way to the printer is retried this often, with a delay
+# growing by this step. The FilaMan backend and Moonraker usually come up
+# together, so the first attempts after a power cycle can well go nowhere.
+PUSH_FETCH_ATTEMPTS = 4
+PUSH_FETCH_RETRY_DELAY = 2.0
+
 # Moonraker renders config templates with '{' / '}' as the Jinja variable
 # delimiters, so a literal brace in a plain value would be stripped. Only
 # expand options that actually reference a template.
@@ -364,7 +370,9 @@ class FilaManManager:
         }
         for obj_name in self.filament_sensors:
             objects[obj_name] = ["filament_detected"]
-        if self._has_filament_detect and self.respond_to_filament_requests:
+        if self._has_filament_detect:
+            # Subscribed even when we never answer a request: a channel that is
+            # still detecting also invalidates its filament_exist entry.
             objects["filament_detect"] = ["state"]
         if self._has_print_task_config:
             objects["print_task_config"] = ["filament_exist"]
@@ -399,10 +407,15 @@ class FilaManManager:
             )
 
         # Evaluated last: releasing a spool needs both the restored assignments
-        # and _last_epos, and the re-push must see the cleaned up state.
+        # and _last_epos, and the re-push must see the cleaned up state. The
+        # detect state is recorded before occupancy so the latter knows which
+        # channels the printer is still probing, and requests are answered
+        # afterwards, once the merged occupancy is final.
+        requested = self._record_filament_detect_state(result)
         self._apply_sensor_states(result, initial=True)
         self._apply_filament_exist(result, initial=True)
-        self._apply_filament_detect_state(result)
+        for channel in requested:
+            self._handle_filament_request(channel)
         if self.repush_on_startup:
             self._repush_timer = self.eventloop.delay_callback(
                 self.repush_delay, self._repush_assigned_spools
@@ -435,9 +448,11 @@ class FilaManManager:
                     self._add_extrusion(self.spool_id, epos - self._highest_epos)
                 self._highest_epos = epos
 
+        requested = self._record_filament_detect_state(status)
         self._apply_sensor_states(status)
         self._apply_filament_exist(status)
-        self._apply_filament_detect_state(status)
+        for channel in requested:
+            self._handle_filament_request(channel)
 
     # ------------------------------------------------------------------ #
     # Filament runout sensors: detect a toolhead running empty            #
@@ -536,7 +551,18 @@ class FilaManManager:
 
         for channel, present in enumerate(exist):
             extruder = "extruder" if channel == 0 else f"extruder{channel}"
-            self._update_presence(extruder, printer=bool(present), initial=initial)
+            value: Optional[bool] = bool(present)
+            if not value and self._is_detecting(channel):
+                # The printer is still probing this channel, so its
+                # filament_exist entry has not been filled in yet. Right after
+                # a power cycle that probe is often still running when Klipper
+                # reports ready, and taking the empty entry at face value would
+                # release the spool before the printer ever answered.
+                value = None
+            self._update_presence(extruder, printer=value, initial=initial)
+
+    def _is_detecting(self, channel: int) -> bool:
+        return self._filament_detect_state.get(channel) == FILAMENT_DT_STATE_DETECTING
 
     def _update_presence(
         self,
@@ -614,22 +640,31 @@ class FilaManManager:
     # Printer requests: filament_detect.state -> re-push assigned spools  #
     # ------------------------------------------------------------------ #
 
-    def _apply_filament_detect_state(self, status: Dict[str, Any]) -> None:
+    def _record_filament_detect_state(self, status: Dict[str, Any]) -> List[int]:
+        """Store the new detect state, return the channels that just started asking.
+
+        Recording is separate from answering so that occupancy can be evaluated
+        in between: a channel that is still detecting has no valid
+        filament_exist entry, and an answer must see the final occupancy.
+        """
         detect = status.get("filament_detect")
         if not isinstance(detect, dict):
-            return
+            return []
         state = detect.get("state")
         if not isinstance(state, list):
-            return
+            return []
 
+        requested: List[int] = []
         for channel, value in enumerate(state):
             previous = self._filament_detect_state.get(channel)
             self._filament_detect_state[channel] = value
-            if value != FILAMENT_DT_STATE_DETECTING or previous == value:
-                continue
-            self._handle_filament_request(channel)
+            if value == FILAMENT_DT_STATE_DETECTING and previous != value:
+                requested.append(channel)
+        return requested
 
     def _handle_filament_request(self, channel: int) -> None:
+        if not self.respond_to_filament_requests:
+            return
         extruder = "extruder" if channel == 0 else f"extruder{channel}"
         spool_id = self.extruder_spools.get(extruder)
         if spool_id is None:
@@ -764,7 +799,12 @@ class FilaManManager:
         return None
 
     async def _push_spool_to_printer(self, extruder: str, spool_id: Optional[int]) -> None:
-        """Forward spool color/material to the printer via filament_detect/set."""
+        """Forward spool color/material to the printer via filament_detect/set.
+
+        The spool lookup is retried: right after a power cycle the FilaMan
+        backend is regularly not answering yet, and swallowing that failure
+        leaves the printer channel empty until the next manual assignment.
+        """
         channel = self._extruder_to_channel(extruder)
         port = self.server.get_host_info()["port"]
         url = f"http://localhost:{port}/printer/filament_detect/set"
@@ -776,12 +816,12 @@ class FilaManManager:
                 connect_timeout=2.0, request_timeout=5.0,
             )
             if response.has_error():
-                logging.debug(
+                logging.warning(
                     f"filament_detect clear ch{channel} failed: {response.error}"
                 )
             return
 
-        spool_data, response = await self._fetch_spool(spool_id)
+        spool_data = await self._fetch_spool_with_retry(extruder, spool_id, channel)
         if spool_data is None:
             return
 
@@ -820,7 +860,7 @@ class FilaManManager:
             connect_timeout=2.0, request_timeout=5.0,
         )
         if response.has_error():
-            logging.debug(
+            logging.warning(
                 f"filament_detect set ch{channel} spool {spool_id} failed: {response.error}"
             )
         else:
@@ -829,6 +869,36 @@ class FilaManManager:
                 f"type={info.get('MAIN_TYPE')}, vendor={info.get('VENDOR')}, "
                 f"color=#{info.get('RGB_1', 0):06X}"
             )
+
+    async def _fetch_spool_with_retry(
+        self,
+        extruder: str,
+        spool_id: int,
+        channel: int,
+    ) -> Optional[Dict[str, Any]]:
+        for attempt in range(1, PUSH_FETCH_ATTEMPTS + 1):
+            if self.is_closing:
+                return None
+            spool_data, response = await self._fetch_spool(spool_id)
+            if spool_data is not None:
+                return spool_data
+            if response.status_code == 404:
+                # A deleted spool will not reappear; _check_spool_deleted picks
+                # this up and clears the assignment.
+                logging.info(f"Spool {spool_id} of {extruder} no longer exists")
+                return None
+            if self.extruder_spools.get(extruder) != spool_id:
+                # Reassigned while we were retrying; that push owns the channel.
+                return None
+            if attempt == PUSH_FETCH_ATTEMPTS:
+                logging.warning(
+                    f"Could not fetch spool {spool_id} for {extruder} in "
+                    f"{attempt} attempts, printer channel {channel} left "
+                    f"unchanged: {self._get_response_error(response)}"
+                )
+                return None
+            await asyncio.sleep(PUSH_FETCH_RETRY_DELAY * attempt)
+        return None
 
     def set_active_spool(self, spool_id: Union[int, None]) -> None:
         """Set spool for the currently active extruder (backward-compatible)."""

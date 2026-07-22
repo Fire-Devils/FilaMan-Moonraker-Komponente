@@ -162,10 +162,15 @@ component treats a sensor's `false` at startup as **unknown** and never releases
 on it; only a `true`, or a later change during operation, counts.
 
 Where the printer exposes `print_task_config.filament_exist` (Snapmaker U1), that array is
-used as the authoritative occupancy instead. It is valid immediately at startup and is
-what the printer's own display shows, so a toolhead emptied while the printer was off is
-still detected and released. Without that object, occupancy simply stays unknown until the
-sensor reports something.
+used as the authoritative occupancy instead — it is what the printer's own display shows,
+so a toolhead emptied while the printer was off is still detected and released. Without
+that object, occupancy simply stays unknown until the sensor reports something.
+
+An entry only counts while the printer is not probing that channel, though: when
+`filament_detect.state[channel]` reads *detecting*, the matching `filament_exist` entry has
+not been filled in yet and is treated as **unknown**. After a power cycle that probe is
+regularly still running by the time Klipper reports ready, and taking the empty entry at
+face value would have released every assignment before the printer ever asked.
 
 Unknown never blocks anything: spools are still re-pushed to the printer, and only a
 *confirmed* empty channel is skipped. `GET /server/filaman/status` exposes the merged

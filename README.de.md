@@ -169,10 +169,17 @@ und nicht *leer*. Die Komponente wertet ein `false` vom Sensor beim Start deshal
 späterer Wechsel im laufenden Betrieb.
 
 Stellt der Drucker `print_task_config.filament_exist` bereit (Snapmaker U1), wird dieses
-Array stattdessen als maßgebliche Belegung genutzt. Es ist schon beim Start gültig und ist
-die Quelle, die auch das Drucker-Display anzeigt. Ein Toolhead, der im ausgeschalteten
-Zustand geleert wurde, wird damit weiterhin erkannt und freigegeben. Ohne dieses Objekt
-bleibt die Belegung schlicht unbekannt, bis der Sensor etwas meldet.
+Array stattdessen als maßgebliche Belegung genutzt — es ist die Quelle, die auch das
+Drucker-Display anzeigt. Ein Toolhead, der im ausgeschalteten Zustand geleert wurde, wird
+damit erkannt und freigegeben. Ohne dieses Objekt bleibt die Belegung schlicht unbekannt,
+bis der Sensor etwas meldet.
+
+Ein Eintrag zählt allerdings nur, wenn der Drucker den Kanal nicht gerade prüft: Steht
+`filament_detect.state[kanal]` auf *detecting*, ist der zugehörige `filament_exist`-Eintrag
+noch nicht gefüllt und wird als **unbekannt** gewertet. Nach dem Einschalten läuft diese
+Prüfung regelmäßig noch, wenn Klipper bereits `ready` meldet — ein leerer Eintrag für bare
+Münze genommen hätte dort jede Zuweisung freigegeben, bevor der Drucker überhaupt gefragt
+hat.
 
 „Unbekannt" blockiert nichts: Spulen werden weiterhin an den Drucker nachgeschoben, und
 nur ein *bestätigt* leerer Kanal wird übersprungen. `GET /server/filaman/status` liefert
