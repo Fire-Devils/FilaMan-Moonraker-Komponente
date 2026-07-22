@@ -155,6 +155,20 @@ class FilaManManager:
         self._register_endpoints()
         self._register_remote_methods()
 
+        # Mainsail only shows its Spoolman panel when a component literally
+        # named "spoolman" exists in Moonraker's component registry (see
+        # mainsail src/store/gui/getters.ts). The HTTP endpoint aliases alone
+        # are not enough, so register this component under the "spoolman"
+        # alias as well. component_init()/close() are guarded against the
+        # resulting double lifecycle calls.
+        try:
+            self.server.register_component("spoolman", self)
+        except Exception:
+            logging.info(
+                "FilaMan: 'spoolman' component already registered, "
+                "skipping registry alias"
+            )
+
     def _get_float_option(
         self,
         config: ConfigHelper,
@@ -288,6 +302,9 @@ class FilaManManager:
         return [self.spool_id]
 
     async def component_init(self) -> None:
+        if getattr(self, "_component_initialized", False):
+            return
+        self._component_initialized = True
         stored_extruder_spools = await self.database.get_item(
             DB_NAMESPACE, EXTRUDER_SPOOLS_KEY, None
         )
@@ -1075,6 +1092,8 @@ class FilaManManager:
         if body is not None and method == "GET":
             raise self.server.error("GET requests cannot have a body")
 
+        raw_method = method
+        raw_body = body
         path_suffix = self._normalize_proxy_path(path)
         method, path_suffix, body = await self._map_legacy_use_request(
             method,
@@ -1089,10 +1108,34 @@ class FilaManManager:
                 normalized_query = None
 
         query_suffix = f"?{normalized_query}" if normalized_query is not None else ""
-        full_url = f"{self.api_url}{path_suffix}{query_suffix}"
 
-        logging.debug(f"Proxying {method} request to {full_url}")
-        response = await self._request(method=method, url=full_url, body=body)
+        # Spoolman-shaped requests (Mainsail's spool lookups and other
+        # Spoolman-aware tools use paths like /v1/spool/{id}) are preferred to
+        # the backend's Spoolman-compatible API mount, so the response shape
+        # matches what the caller expects (e.g. filament.name instead of the
+        # native designation field). If the compat layer is not installed the
+        # request falls back to the native API with the legacy path mapping.
+        attempts: List[Any] = []
+        if path.startswith("/v1"):
+            attempts.append(
+                (
+                    raw_method,
+                    f"{self.server_url}/spoolman/api{path}{query_suffix}",
+                    raw_body,
+                )
+            )
+        attempts.append(
+            (method, f"{self.api_url}{path_suffix}{query_suffix}", body)
+        )
+
+        response = None
+        for idx, (req_method, full_url, req_body) in enumerate(attempts):
+            logging.debug(f"Proxying {req_method} request to {full_url}")
+            response = await self._request(
+                method=req_method, url=full_url, body=req_body
+            )
+            if response.status_code != 404 or idx == len(attempts) - 1:
+                break
 
         if not use_v2_response:
             response.raise_for_status()
@@ -1160,6 +1203,8 @@ class FilaManManager:
         self.server.send_event("spoolman:spoolman_status_changed", payload)
 
     async def close(self) -> None:
+        if self.is_closing:
+            return
         self.is_closing = True
         self.report_timer.stop()
         self._cancel_spool_check_task()
