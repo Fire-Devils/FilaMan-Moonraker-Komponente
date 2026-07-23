@@ -108,7 +108,7 @@ default_diameter_mm: 1.75
 - `repush_on_startup` (optional): alle zugewiesenen Spulen einmalig erneut an den Drucker
   senden, sobald Klipper bereit ist, Standard `True`
 - `repush_delay` (optional): Wartezeit in Sekunden vor diesem erneuten Senden, Standard
-  `3.0`
+  `10.0`
 
 ### Woher der API-Schlüssel kommt
 
@@ -256,8 +256,12 @@ beim Aus- und Einschalten. Zwei Mechanismen stellen sie wieder her:
   überschrieben wird.
 - **Beim Start:** `repush_delay` Sekunden, nachdem Klipper bereit ist, wird jede
   zugewiesene Spule einmalig an den Drucker geschickt. Extruder, deren Sensor kein
-  Filament meldet, werden übersprungen. Die Verzögerung gibt dem druckereigenen
-  RFID-Scan einen Vorsprung.
+  Filament meldet, werden übersprungen. Die Verzögerung ist nötig, weil der Drucker
+  während des Bootens noch seine eigene Filamenterkennung fährt und dabei alles
+  überschreibt, was vorher ankommt. Reicht der Standardwert auf deinem Gerät nicht,
+  setze ihn höher. Bewusst nur ein Push — jeder Push
+  leert den Kanal, bevor er ihn neu setzt, ein zweiter würde einen bereits korrekten
+  Kanal also nur flackern lassen.
 
 Beides lässt sich über `respond_to_filament_requests` und `repush_on_startup` abschalten.
 Das zuletzt gesehene State-Array liefert `GET /server/filaman/status` im Feld

@@ -103,7 +103,7 @@ default_diameter_mm: 1.75
   the printer, default `True`
 - `repush_on_startup` (optional): re-send all assigned spools to the printer once after
   Klipper becomes ready, default `True`
-- `repush_delay` (optional): seconds to wait before that re-push, default `3.0`
+- `repush_delay` (optional): seconds to wait before that re-push, default `10.0`
 
 ### Where to get the API key
 
@@ -244,7 +244,11 @@ power cycle. Two mechanisms restore it:
   read is never overwritten with an empty payload.
 - **On startup:** `repush_delay` seconds after Klipper becomes ready, every assigned spool
   is sent to the printer once. Extruders whose sensor reports no filament are skipped. The
-  delay gives the printer's own RFID scan a head start.
+  delay is needed because the printer keeps running its own filament detection while
+  booting and overwrites anything that arrives before that has finished. Raise it if the
+  default is not enough on your machine.
+  Deliberately a single push — each push clears the channel before setting it again, so a
+  second one would only make an already correct channel flicker.
 
 Both can be turned off via `respond_to_filament_requests` and `repush_on_startup`. The
 last seen state array is exposed as `filament_detect_state` by

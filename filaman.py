@@ -82,8 +82,10 @@ class FilaManManager:
         self.repush_on_startup: bool = config.getboolean(
             "repush_on_startup", default=True
         )
+        # Long enough for the printer to finish its own boot-time filament
+        # detection: anything pushed before that is overwritten again.
         self.repush_delay: float = config.getfloat(
-            "repush_delay", default=3.0, minval=0.0
+            "repush_delay", default=10.0, minval=0.0
         )
 
         self.default_density_g_cm3 = self._get_float_option(
@@ -681,6 +683,12 @@ class FilaManManager:
         self.eventloop.create_task(self._push_spool_to_printer(extruder, spool_id))
 
     def _repush_assigned_spools(self) -> None:
+        """Send every assigned spool to the printer, once.
+
+        Deliberately a single shot: each push clears the channel before setting
+        it again, so repeating it would make an already correct channel flicker.
+        The delay is what makes it land, not the repetition.
+        """
         self._repush_timer = None
         for extruder, spool_id in self.extruder_spools.items():
             if spool_id is None or self.filament_present.get(extruder) is False:
