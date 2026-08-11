@@ -254,6 +254,10 @@ Both can be turned off via `respond_to_filament_requests` and `repush_on_startup
 last seen state array is exposed as `filament_detect_state` by
 `GET /server/filaman/status`.
 
+- **On request:** `POST /server/filaman/repush` repeats the same startup repush
+  immediately, for when the printer still shows a channel as unknown and you would
+  rather not restart Moonraker to trigger it again.
+
 ## Endpoints
 
 Primary endpoints:
@@ -261,12 +265,14 @@ Primary endpoints:
 - `GET|POST /server/filaman/spool_id`
 - `GET /server/filaman/status`
 - `POST /server/filaman/proxy`
+- `POST /server/filaman/repush`
 
 Additional Spoolman aliases are always available:
 
 - `GET|POST /server/spoolman/spool_id`
 - `GET /server/spoolman/status`
 - `POST /server/spoolman/proxy`
+- `POST /server/spoolman/repush`
 
 ## Remote methods
 

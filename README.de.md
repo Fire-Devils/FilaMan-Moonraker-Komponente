@@ -267,6 +267,10 @@ Beides lässt sich über `respond_to_filament_requests` und `repush_on_startup` 
 Das zuletzt gesehene State-Array liefert `GET /server/filaman/status` im Feld
 `filament_detect_state`.
 
+- **Auf Wunsch:** `POST /server/filaman/repush` wiederholt denselben Start-Repush sofort,
+  falls der Drucker einen Kanal weiterhin als unbekannt zeigt und ein Moonraker-Neustart
+  dafür zu umständlich wäre.
+
 ## Endpoints
 
 Primäre Endpoints:
@@ -274,12 +278,14 @@ Primäre Endpoints:
 - `GET|POST /server/filaman/spool_id`
 - `GET /server/filaman/status`
 - `POST /server/filaman/proxy`
+- `POST /server/filaman/repush`
 
 Zusätzlich stehen die Spoolman-Aliasse immer zur Verfügung:
 
 - `GET|POST /server/spoolman/spool_id`
 - `GET /server/spoolman/status`
 - `POST /server/spoolman/proxy`
+- `POST /server/spoolman/repush`
 
 ## Remote-Methoden
 

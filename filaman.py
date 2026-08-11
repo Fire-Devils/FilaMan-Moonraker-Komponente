@@ -314,6 +314,11 @@ class FilaManManager:
                 RequestType.GET,
                 self._handle_status_request,
             )
+            self.server.register_endpoint(
+                f"{prefix}/repush",
+                RequestType.POST,
+                self._handle_repush_request,
+            )
 
     def _register_remote_methods(self) -> None:
         self.server.register_remote_method(
@@ -1184,6 +1189,14 @@ class FilaManManager:
         return {"spool_id": self.spool_id, "extruder_spools": self.extruder_spools}
 
     async def _handle_spool_ids_request(self, web_request: WebRequest) -> Dict[str, Any]:
+        return {"extruder_spools": self.extruder_spools}
+
+    async def _handle_repush_request(self, web_request: WebRequest) -> Dict[str, Any]:
+        """Manually repeat the startup repush: send every assigned spool to the
+        printer again, right away, instead of waiting for the next restart.
+        """
+        self._cancel_repush_timer()
+        self._repush_assigned_spools()
         return {"extruder_spools": self.extruder_spools}
 
     def _normalize_proxy_path(self, path: str) -> str:
